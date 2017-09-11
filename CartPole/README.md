@@ -1,7 +1,7 @@
 @(fyp)[cart-pole]
 ##### README.MD
 
-![Alt text](./image/cartpole-screenshot.png)
+![Alt text](./image/cartpole-screenshot.png=60x30)
 
 The is a cart (the black box) and a pole, the cart can go left or right along the axis, the goal is to balance the pole as long as possible.
 
