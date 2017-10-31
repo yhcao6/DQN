@@ -1,291 +1,305 @@
+import gym, random
 import numpy as np
-from keras import backend as K
-from keras.layers import Conv2D, Dense
-from keras.models import Sequential
-from keras.optimizers import RMSprop
-import gym
-import random
-import cv2
 import tensorflow as tf
+from collections import deque
+from keras.models import Sequential
+from keras.layers import Dense, Flatten
+from keras.layers.convolutional import Conv2D
+from keras.optimizers import RMSprop
+from keras import backend as K
+from skimage.color import rgb2gray
+from skimage.transform import resize
 
 
-IMAGE_HEIGHT = 84
+# hyperparameters
+# game name
+GAME = 'BreakoutNoFrameskip-v4'
+env = gym.make(GAME)
+ACTION_COUNT = env.action_space.n  # action_count
+
+# state size (4, 84, 84)
 IMAGE_WIDTH = 84
-HUBER_THRESHOLD = 1
-BATCH_SIZE = 32
-MEMORY_CAPACITY = 1000000
+IMAGE_HEIGHT = 84
 HISTORY_LENGTH = 4
-DISCOUNT = 0.99
-ACTION_REPEAT = 4
-UPDATE_FREQUENCY = 4
-LEARNING_RATE = 0.00025
-GRADIENT_MOMENTUM = 0.95
-SQUARED_GRADIENT_MOMENTUM = 0.95
-MIN_SQUARED_GRADIENT = 0.01
-EPSILON_INITIAL = 1
-EPSILON_FINAL = 0.1
-EPSILON_DECAY_STEPS = 1000000
-REPLAY_START = 5e4
+
+BATCH_SIZE = 32
+MEMORY_SIZE = 1000000
+
+# random start steps
 NO_OP_MAX = 30
-LEARN_START = 50000
+
+# repeat same action
+ACTION_REPEAT = 4
+
+# exploration
+INITIAL_EXPLORATION = 1
+FINAL_EXPLORATION = 0.1
+FINAL_EXPLORATION_FRAME = 1000000
+
+# learning_rate
+LEARING_RATE = 0.00025
+
+# DISCOUNT FACTOR
+DISCOUNT = 0.99
+
+# REPLAY_START
+REPLAY_START = 50000
+
 REPLAY_FREQUENCY = 4
+UPDATE_FREQUENCY = 10000
+
+HUBER_LOSS_DELTA = 1.0
 
 
-def huber_loss(y_pred, y_true):
-    error = y_pred - y_true
-    cond = np.abs(error) < HUBER_THRESHOLD
-    l1 = .5 * np.square(error)
-    l2 = HUBER_THRESHOLD * (np.abs(error) - .5 * HUBER_THRESHOLD)
-    loss = tf.where(cond, l1, l2)
-    return K.mean(loss)
+# preprocess img
+def preprocess(img):
+    # 1. exact Y channel
+    gray = rgb2gray(img)  # 210 x 160
+    # 2. rescale to 84 x 84
+    gray_rescale = resize(gray, (84, 84), mode='constant')
+    return gray_rescale
 
 
-def preprocess(im):
-    gray = np.dot(im, [0.299, 0.587, 0.114]) / 255.
-    res = cv2.resize(gray, (IMAGE_HEIGHT, IMAGE_WIDTH))
-    return res[..., np.newaxis].transpose(2, 0, 1)
+class Agent(object):
+    def __init__(self):
+        # neural network
+        self.model = self._build_model()
+        self.model_ = self._build_model()
 
+        # experience memory
+        self.memory = Memory()
 
-class Brain:
-    def __init__(self, state_size, n_action):
-        self.state_size = state_size
-        self.n_action = n_action
-        self.model = self._build_dqn()  # prediction network
-        self.model_ = self._build_dqn() # target network
+        self.steps = 0
+        self.epsilon = INITIAL_EXPLORATION
+        self.epsilon_decay_step = (INITIAL_EXPLORATION - FINAL_EXPLORATION) / FINAL_EXPLORATION_FRAME
 
-    def _build_dqn(self):
+        self.optimizer = self.optimizer()
+
+        # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+        self.sess = tf.Session()
+        K.set_session(self.sess)
+
+        self.avg_loss = 0.
+        self.summary_placeholders, self.update_ops, self.summary_op = self.setup_summary()
+        self.summary_writer = tf.summary.FileWriter('summary', self.sess.graph)
+
+        self.sess.run(tf.global_variables_initializer())
+
+    def _build_model(self):
         model = Sequential()
 
-        model.add(Conv2D(32, (8, 8), strides=(4, 4), activation='relu', input_shape=self.state_size, data_format='channels_first'))
+        model.add(Conv2D(32, (8, 8), strides=(4, 4), activation='relu', input_shape=(IMAGE_HEIGHT, IMAGE_WIDTH, HISTORY_LENGTH)))
         model.add(Conv2D(64, (4, 4), strides=(2, 2), activation='relu'))
         model.add(Conv2D(64, (3, 3), strides=(1, 1), activation='relu'))
-
+        model.add(Flatten())
         model.add(Dense(512, activation='relu'))
-        model.add(Dense(self.n_action))
-
-        opt = RMSprop(LEARNING_RATE, epsilon=0.01)
-
-        model.compile(optimizer=opt, loss=huber_loss)
-
+        model.add(Dense(ACTION_COUNT, activation='linear'))
         return model
 
-    def train(self, X, y, epochs=1, verbose=0):
-        self.model.fit(X, y, epochs=epochs, verbose=verbose)
+    def optimizer(self):
+        action = K.placeholder(shape=(None,), dtype='int32')
+        target_q = K.placeholder(shape=(None,), dtype='float32')
+        action_mask = K.one_hot(action, ACTION_COUNT)
 
-    def predict(self, X, target=False):
-        # one sample
-        if len(X.shape) == 3:
-            X = X[np.newaxis, ...]
+        pred = self.model.output
+        q = K.sum(pred * action_mask, axis=1)
+        err = K.abs(target_q - q)
 
-        if target:
-            return self.model_.predict(X)
+        # huge loss
+        l2 = K.clip(err, 0.0, 1.0)
+        l1 = err - l2
+        loss = K.mean(0.5 * K.square(l2) + l1)
+
+        optimizer = RMSprop(lr=LEARING_RATE, epsilon=0.01)
+        updates = optimizer.get_updates(self.model.trainable_weights, [], loss)
+        train = K.function([self.model.input, action, target_q], [loss], updates=updates)
+
+        return train
+
+
+    # e-greedy
+    def choose_action(self, history):
+        if np.random.rand() <= self.epsilon:
+            return random.randint(0, ACTION_COUNT - 1)
         else:
-            return self.model.predict(X)
+            return np.argmax(self.model.predict(history)[0])
+
+    def observe(self, history, action, reward, history_, dead):
+        self.memory.add(history, action, reward, history_, dead)
+        self.steps += 1
+
+        if self.steps > REPLAY_START:
+            # epsilon decrease as time
+            self.epsilon -= self.epsilon_decay_step
+            if self.steps % REPLAY_FREQUENCY == 0:
+                self.replay()
+
+            if self.steps % UPDATE_FREQUENCY == 0:
+                self.update()
+
+    def replay(self):
+        if len(self.memory.memory) < REPLAY_START:
+            return
+
+        batch = self.memory.sample()
+
+        # batch[i] (history, action, reward, history_, dead)
+        historys = np.zeros((BATCH_SIZE, IMAGE_HEIGHT, IMAGE_WIDTH, HISTORY_LENGTH))
+        historys_ = np.zeros((BATCH_SIZE, IMAGE_HEIGHT, IMAGE_WIDTH, HISTORY_LENGTH))
+        actions = []
+        rewards = []
+        deads = []
+        target_q = np.zeros((BATCH_SIZE,))
+
+        for i in range(BATCH_SIZE):
+            historys[i] = batch[i][0]
+            historys_[i] = batch[i][3]
+            actions.append(batch[i][1])
+            rewards.append(batch[i][2])
+            deads.append(batch[i][4])
+
+        pred = self.model_.predict(historys_)
+
+        # Q(s, a) = r + gamma * np.max(Q(s', a))
+        for i in range(BATCH_SIZE):
+            if deads[i]:
+                target_q[i] = rewards[i]
+            else:
+                target_q[i] = rewards[i] + DISCOUNT * np.amax(pred[i])
+
+        loss = self.optimizer([historys, actions, target_q])
+        self.avg_loss += loss[0]
 
     def update(self):
         self.model_.set_weights(self.model.get_weights())
 
+    def setup_summary(self):
+        total_reward = tf.Variable(0.)
+        avg_loss = tf.Variable(0.)
 
-class Agent:
-    def __init__(self, state_size, n_action):
-        self.state_size = state_size
-        self.n_action = n_action
-        self.brain = Brain(state_size, n_action)
-        self.memory = Memory(MEMORY_CAPACITY)
-        self.epsilon = EPSILON_INITIAL
-        self.global_steps = 0
+        tf.summary.scalar('total reward', total_reward)
+        tf.summary.scalar('average loss', avg_loss)
 
-    def choose_action(self, s):
-        if random.random() < self.epsilon:
-            return random.randint(0, self.n_action - 1)
-        else:
-            return np.argmax(self.brain.predict(s))
-
-    def observe(self, sample):
-        self.memory.add(sample)
-
-        self.global_steps += 1
-        self.epsilon = EPSILON_FINAL + max(0, (EPSILON_INITIAL - EPSILON_FINAL) * (EPSILON_DECAY_STEPS - max(0, self.global_steps - LEARN_START)) / EPSILON_DECAY_STEPS)
-
-    def replay(self):
-        s, a, r, s_, terminal = self.memory.sample(BATCH_SIZE)
-
-        p = self.brain.predict(s)
-        p_ = self.brain.predict(s_)
-        max_p_ = np.max(p_, axis=1)
-
-        y = p
-        for i in range(BATCH_SIZE):
-            if terminal[i] == 1:
-                y[i, a[i]] = r[i]
-            else:
-                y[i, a[i]] = r[i] + DISCOUNT * max_p_[i]
-
-        self.brain.train(s, y)
+        summary_vars = [total_reward, avg_loss]
+        summary_placeholders = [tf.placeholder(tf.float32) for _ in range(len(summary_vars))]
+        update_ops = [summary_vars[i].assign(summary_placeholders[i]) for i in range(len(summary_vars))]
+        summary_op = tf.summary.merge_all()
+        return summary_placeholders, update_ops, summary_op
 
 
-class RandomAgent:
-    def __init__(self, n_action):
-        self.n_action = n_action
-        self.memory = Memory(MEMORY_CAPACITY)
-        self.steps = 0
+class Memory(object):
+    def __init__(self):
+        self.memory = deque(maxlen=MEMORY_SIZE)
 
-    def choose_action(self, s):
-        return random.randint(0, self.n_action - 1)
+    def add(self, history, action, reward, history_, dead):
+        self.memory.append((history, action, reward, history_, dead))
 
-    def replay(self):
-        pass
-
-    def observe(self, sample):
-        self.memory.add(sample)
-        self.steps += 1
+    def sample(self):
+        return random.sample(self.memory, BATCH_SIZE)
 
 
-class Memory:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.states = np.zeros((self.capacity, 1, IMAGE_HEIGHT, IMAGE_WIDTH))
-        self.actions = np.zeros((self.capacity, 1), dtype=np.int)
-        self.rewards = np.zeros((self.capacity, 1))
-        self.terminals = np.zeros((self.capacity, 1), dtype=np.int)
-        self.current = 0
-        self.n = 0
+class Environment(object):
+    def __init__(self):
+        self.env = gym.make(GAME).unwrapped
+        self.episode = 0
 
-    def add(self, sample):
-        self.states[self.current] = sample[3]
-        self.actions[self.current] = sample[1]
-        self.rewards[self.current] = sample[2]
-        self.terminals[self.current] = sample[4]
-        self.current = (self.current + 1) % self.capacity
-        self.n += 1
-
-    def sample(self, n):
-        # indexes of post_states
-        if self.n <= self.capacity:
-            indexes = random.sample(range(4, self.current), n)
-        else:
-            indexes = random.sample(range(self.current + 4, self.current + self.capacity), n)
-
-        pre_states = np.zeros((n, HISTORY_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH))
-        post_states = np.zeros((n, HISTORY_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH))
-        rewards = np.zeros((n, 1))
-        actions = np.zeros((n, 1), dtype=np.int)
-        terminals = np.zeros((n, 1), dtype=np.int)
-
-        for i in range(len(indexes)):
-            index = (indexes[i]) % self.capacity
-            pre_states[i] = self.states[index - 4: index, 0, ...]
-            post_states[i] = self.states[index - 3: index + 1, 0, ...]
-            actions[i] = self.actions[index, ...]
-            rewards[i] = self.rewards[index, ...]
-            terminals[i] = self.terminals[index, ...]
-
-        return (pre_states, actions.flatten(), rewards.flatten(), post_states, terminals.flatten())
-
-
-class Environment:
-    def __init__(self, problem):
-        self.problem = problem
-        self.env = gym.make(problem).unwrapped
-        self.episodes = 0
-        self.trace_r = []
-
-    def step(self, a):
-        states = []
+    def step(self, action):
         cumulated_reward = 0
         start_lives = self.env.ale.lives()
-        for i in range(ACTION_REPEAT):
-            s_, r, done, info = self.env.step(a)
-            states.append(s_)
-            cumulated_reward += np.clip(r, -1., 1.)
-            if info['ale.lives'] < start_lives:
+        dead = False
+        tmp = []
+
+        for _ in range(ACTION_REPEAT):
+            s, r, _, info = self.env.step(action)
+            cumulated_reward += r
+
+            if start_lives > info['ale.lives']:
                 cumulated_reward -= 1
+                dead = True
+            else:
+                tmp.append(s)
+
+            if dead:
                 break
 
-        if len(states) > 1:
-            s_ = np.maximum.reduce([states[-2], states[-1]])
+        # take maximum in last two frames
+        if len(tmp) > 1:
+            s_ = np.maximum.reduce([tmp[-1], tmp[-2]])
+        else:
+            s_ = s
 
-        return preprocess(s_), cumulated_reward, done, info
+        return s_, cumulated_reward, dead
+
+
 
     def run(self, agent):
-        self.env.reset()
-        R = 0
+        s = self.env.reset()
 
-        for i in range(random.randint(1, NO_OP_MAX)):
-            s = self.step(1)[0]
+        dead = False
+        done = False
 
-        s = np.tile(s[0, ...], (HISTORY_LENGTH, 1, 1))
+        # step 1 (1, 30) time steps
+        # here each step only one frame
+        for _ in range(random.randint(1, NO_OP_MAX)):
+            s = self.env.step(1)[0]
 
-        while True:
-            a = agent.choose_action(s)
+        s = preprocess(s)
+        history = np.stack((s, s, s, s), axis=2)  # H x W x C = 84 x 84 x 4
+        history = history[np.newaxis, ...]
 
-            if a == 0:
-                a = 1
-            elif a == 1:
-                a = 2
+        total_reward = 0
+        step = 0
+        while not done:
+            step += 1
+            action = agent.choose_action(history)
+
+            if action == 0:
+                real_action = 1
+            elif action == 1:
+                real_action = 2
             else:
-                a = 3
+                real_action = 3
 
-            s_, r, done, _ = self.step(a)
+            s_, r, dead = self.step(action)
+            total_reward += r  # true reward, just use for visulization
+            s_ = preprocess(s_)
+            s_ = s_[np.newaxis, ..., np.newaxis]
+            # clip reward, reduce difficulty
+            r = np.clip(r, -1., 1.)
 
-            if done:
-                done = 1
+            history_ = np.append(history[..., 1:], s_, axis=3)
+
+            # add to memory
+            agent.observe(history, action, r, history_, dead)
+
+            if dead:
+                # if lives is 0, game over
+                if self.env.ale.lives() == 0:
+                    self.episode += 1
+                    print 'episode', self.episode, 'total reward is', total_reward
+                    done = True
+
+                    if agent.steps > REPLAY_START:
+                        states = [total_reward, agent.avg_loss / float(step)]
+                        for i in range(len(states)):
+                            agent.sess.run(agent.update_ops[i], feed_dict={agent.summary_placeholders[i]: float(states[i])})
+                        summary_str = agent.sess.run(agent.summary_op)
+                        agent.summary_writer.add_summary(summary_str, self.episode)
+
+                    agent.avg_loss = 0.
+                else:
+                    dead = False
             else:
-                done = 0
-
-            agent.observe((s, a, r, s_, done))
-
-            if self.episodes > LEARN_START:
-
-                if self.episodes % REPLAY_FREQUENCY == 0:
-                    agent.replay()
-
-                if self.episodes % UPDATE_FREQUENCY == 0:
-                    agent.brain.update()
-
-            R += r
-
-            if done == 1:
-                self.episodes += 1
-                self.trace_r.append(R)
-                # print env.episodes, 'total reward is', R
-                break
-
-            new_s = s
-            new_s[..., :-1] = s[..., 1:]
-            new_s[..., -1] = s_[..., 0]
-            s = new_s
+                history = history_
 
 
-PROBLEM = 'BreakoutNoFrameskip-v4'
-env = Environment(PROBLEM)
-n_action = env.env.action_space.n
-random_agent = RandomAgent(n_action)
-agent = Agent((HISTORY_LENGTH, IMAGE_HEIGHT, IMAGE_WIDTH), n_action)
+agent = Agent()
+env = Environment()
 
 try:
-    while random_agent.steps < LEARN_START:
-        env.run(random_agent)
-
-    agent.memory = random_agent.memory
-    env.episodes = 0
-    env.trace_r = []
-    random_agent = None
-
     while True:
         env.run(agent)
-
-        if env.episodes % 1000 == 0:
-            agent.brain.model.save(PROBLEM + '.h5')
-            print env.episodes, 'last 1000 episodes ave rewards is', np.sum(env.trace_r[-1 - 1000: -1]) / 1000.0
-
+        if env.episode % 1000 == 0:
+            agent.model.save_weights('dqn.h5')
 finally:
-    agent.brain.model.save(PROBLEM + '.h5')
-
-
-
-
-
-
-
-
+    agent.model.save_weights('latest_dqn.h5')
